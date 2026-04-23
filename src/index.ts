@@ -1,24 +1,20 @@
 import * as net from 'node:net';
 
+const DEBUG = process.env.DEYE_DEBUG === '1';
+function hexDump(label: string, buf: Buffer): void {
+  if (!DEBUG) return;
+  const hex = [...buf].map(b => b.toString(16).padStart(2, '0')).join(' ');
+  console.error(`[debug] ${label} (${buf.length}B): ${hex}`);
+}
+
 type TimeSlot = {
   index: number;
-  enabled: boolean;
-  gridChargeEnabled: boolean;
-  generatorChargeEnabled: boolean;
-  gmMode: boolean;
-  buMode: boolean;
-  chMode: boolean;
-  time: string;
+  startTime: string;
+  endTime: string;  // derived: start time of the next slot (wraps from last to first)
   powerW: number;
-  voltageV: number;
   capacityPercent: number;
-  raw: {
-    enable: number;
-    time: number;
-    power: number;
-    voltage: number;
-    capacity: number;
-  };
+  gridCharge: boolean;
+  genCharge: boolean;
 };
 
 type Config = {
@@ -31,11 +27,13 @@ type Config = {
 };
 
 const TOU_ENABLE_REGISTER = 248;
-const TOU_TIME_START_REGISTER = 250;
-const TOU_POWER_START_REGISTER = 256;
-const TOU_VOLTAGE_START_REGISTER = 262;
-const TOU_CAPACITY_START_REGISTER = 268;
-const TOU_CHARGE_ENABLE_START_REGISTER = 274;
+// Register 249 is reserved.
+const TOU_START_TIME_REGISTER = 250;    // 6 registers: sell mode time points (HHMM, 0000-2359)
+const TOU_POWER_REGISTER = 256;         // 6 registers: sell mode power per time point (W)
+const TOU_VOLTAGE_REGISTER = 262;       // 6 registers: sell mode battery voltage target (0.01V)
+const TOU_CAPACITY_REGISTER = 268;      // 6 registers: capacity / SOC target (%)
+const TOU_CHARGE_ENABLE_REGISTER = 274; // 6 registers: bitmask (bit0=grid, bit1=gen, bit2=GM, bit3=BU, bit4=CH)
+// End time is not a separate register — it equals the start time of the next slot.
 const TOU_SLOT_COUNT = 6;
 
 function getEnvNumber(name: string, fallback: number): number {
@@ -87,45 +85,33 @@ function decodeTime(raw: number): string {
 
 function decodeChargeEnable(raw: number) {
   return {
-    enabled: raw !== 0,
-    gridChargeEnabled: (raw & 0b00001) !== 0,
-    generatorChargeEnabled: (raw & 0b00010) !== 0,
-    gmMode: (raw & 0b00100) !== 0,
-    buMode: (raw & 0b01000) !== 0,
-    chMode: (raw & 0b10000) !== 0,
+    gridCharge: (raw & 0b00001) !== 0,
+    genCharge:  (raw & 0b00010) !== 0,
   };
 }
 
 function buildSlots(registers: number[]): TimeSlot[] {
-  const enableWords = registers.slice(0, TOU_SLOT_COUNT);
-  const timeWords = registers.slice(TOU_SLOT_COUNT, TOU_SLOT_COUNT * 2);
-  const powerWords = registers.slice(TOU_SLOT_COUNT * 2, TOU_SLOT_COUNT * 3);
-  const voltageWords = registers.slice(TOU_SLOT_COUNT * 3, TOU_SLOT_COUNT * 4);
-  const capacityWords = registers.slice(TOU_SLOT_COUNT * 4, TOU_SLOT_COUNT * 5);
-  const chargeEnableWords = registers.slice(TOU_SLOT_COUNT * 5, TOU_SLOT_COUNT * 6);
+  // registers[0..5]   = 250..255  start times (HHMM)
+  // registers[6..11]  = 256..261  power (W)
+  // registers[12..17] = 262..267  voltage (0.01V, unused)
+  // registers[18..23] = 268..273  capacity (%)
+  // registers[24..29] = 274..279  charge enable bitmask
+  // End time is derived: endTime[i] = startTime[i+1]; last slot wraps to startTime[0]
+  const startTimeWords    = registers.slice(0,                  TOU_SLOT_COUNT);
+  const powerWords        = registers.slice(TOU_SLOT_COUNT,     TOU_SLOT_COUNT * 2);
+  const capacityWords     = registers.slice(TOU_SLOT_COUNT * 3, TOU_SLOT_COUNT * 4);
+  const chargeEnableWords = registers.slice(TOU_SLOT_COUNT * 4, TOU_SLOT_COUNT * 5);
 
   return Array.from({ length: TOU_SLOT_COUNT }, (_, i) => {
     const flags = decodeChargeEnable(chargeEnableWords[i]);
-
     return {
       index: i + 1,
-      enabled: flags.enabled,
-      gridChargeEnabled: flags.gridChargeEnabled,
-      generatorChargeEnabled: flags.generatorChargeEnabled,
-      gmMode: flags.gmMode,
-      buMode: flags.buMode,
-      chMode: flags.chMode,
-      time: decodeTime(timeWords[i]),
+      startTime: decodeTime(startTimeWords[i]),
+      endTime: decodeTime(startTimeWords[(i + 1) % TOU_SLOT_COUNT]),
       powerW: powerWords[i],
-      voltageV: voltageWords[i] / 100,
       capacityPercent: capacityWords[i],
-      raw: {
-        enable: enableWords[i],
-        time: timeWords[i],
-        power: powerWords[i],
-        voltage: voltageWords[i],
-        capacity: capacityWords[i],
-      },
+      gridCharge: flags.gridCharge,
+      genCharge: flags.genCharge,
     };
   });
 }
@@ -152,6 +138,8 @@ function modbusRtuCrc(buf: Buffer): number {
   return crc;
 }
 
+// Checksum covers all bytes between start (0xa5) and the checksum byte itself.
+// Pass the FULL frame buffer; the function sums indices 1 through length-3.
 function solarmanChecksum(buf: Buffer): number {
   let sum = 0;
   for (let i = 1; i < buf.length - 2; i++) sum += buf[i] & 0xff;
@@ -169,29 +157,35 @@ function buildModbusRtuReadRequest(unitId: number, startAddr: number, count: num
 }
 
 function buildSolarmanV5Frame(loggerSn: number, seq: number, modbusRtu: Buffer): Buffer {
-  // Frame layout (total = 11 header + 15 payload-header + modbusRtu.length + 2 trailer):
-  //  [0xa5][len LE2][0x10 0x45][seq][0x00][SN LE4]   <- 11-byte header
-  //  [0x02][0x00][timestamp LE4][0 LE4][0 LE4][0x00]  <- 15-byte payload header
-  //  [Modbus RTU frame]                                <- variable
-  //  [checksum][0x15]                                  <- 2-byte trailer
+  // Request payload (15 bytes):
+  //   frameType    (1 byte)  = 0x02
+  //   sensorType   (2 bytes) = 0x0000
+  //   totalWorkingTime (4 bytes) = 0x00000000  (pysolarmanv5 sends zeros)
+  //   powerOnTime  (4 bytes) = 0x00000000
+  //   offsetTime   (4 bytes) = 0x00000000
+  // then Modbus RTU frame
   const PAYLOAD_HDR = 15;
   const total = 11 + PAYLOAD_HDR + modbusRtu.length + 2;
-  const buf = Buffer.alloc(total, 0);
+  const buf = Buffer.alloc(total, 0); // all zeros by default
 
-  buf.writeUInt8(0xa5, 0);
-  buf.writeUInt16LE(PAYLOAD_HDR + modbusRtu.length, 1);
-  buf.writeUInt16LE(0x4510, 3);                         // control code: request
-  buf.writeUInt8(seq & 0xff, 5);
-  buf.writeUInt8(0x00, 6);
-  buf.writeUInt32LE(loggerSn >>> 0, 7);                 // logger serial number
+  buf.writeUInt8(0xa5, 0);                              // Start
+  buf.writeUInt16LE(PAYLOAD_HDR + modbusRtu.length, 1); // Length
+  buf.writeUInt16LE(0x4510, 3);                         // Control code REQUEST
+  buf.writeUInt8(seq & 0xff, 5);                        // Sequence (first byte)
+  buf.writeUInt8(0x00, 6);                              // Sequence (second byte)
+  buf.writeUInt32LE(loggerSn >>> 0, 7);                 // Logger serial number
 
-  buf.writeUInt8(0x02, 11);                              // frame type: inverter
-  buf.writeUInt32LE(Math.floor(Date.now() / 1000), 13); // delivery timestamp
+  buf.writeUInt8(0x02, 11);                             // Frame type: solar inverter
+  // sensorType (2 bytes) = 0x0000 — stays zero
+  // totalWorkingTime (4 bytes): send current epoch seconds (some loggers require non-zero)
+  buf.writeUInt32LE(Math.floor(Date.now() / 1000), 14);
+  // powerOnTime and offsetTime remain 0x00
 
-  modbusRtu.copy(buf, 26);
+  modbusRtu.copy(buf, 26);                              // 11 + 15 = 26
 
-  buf.writeUInt8(solarmanChecksum(buf.subarray(0, total - 2)), total - 2);
-  buf.writeUInt8(0x15, total - 1);
+  // Checksum: sum of bytes 1..total-3 (full buffer passed so length-2 gives the right bound)
+  buf.writeUInt8(solarmanChecksum(buf), total - 2);
+  buf.writeUInt8(0x15, total - 1);                      // End
 
   return buf;
 }
@@ -207,18 +201,26 @@ function tryExtractRegisters(data: Buffer): number[] | null {
     if (data.length < s + frameLen) continue;            // incomplete – keep buffering
 
     const f = data.subarray(s, s + frameLen);
-    if (f[frameLen - 1] !== 0x15) continue;             // bad end byte
+    if (f[frameLen - 1] !== 0x15) continue;              // bad end byte
 
-    const ctrlCode = f.readUInt16BE(3);                  // response codes: 0x1015 or 0x1045
-    if (ctrlCode !== 0x1015 && ctrlCode !== 0x1045) continue;
+    const ctrlCode = f.readUInt16LE(3);                  // LE: 0x1510 or 0x4510
+    if (ctrlCode !== 0x1510 && ctrlCode !== 0x4510) continue;
 
-    // Response payload header = 14 bytes (offset 11..24); Modbus RTU starts at offset 25
+    // Response payload header = 14 bytes (offset 11..24); Modbus RTU starts at 25
+    // Layout: frameType(1) status(1) totalWorkingTime(4) powerOnTime(4) offsetTime(4)
+    // f[25] = Modbus unit ID
+    // f[26] = Modbus function code
+    // f[27] = Modbus byte count
+    // f[28..] = register data
+    const unitId   = f[25];
     const funcCode = f[26];
-    if (funcCode === 0x83) throw new Error('Modbus exception on FC03 (illegal address or gateway timeout)');
+    if (funcCode === 0x83) throw new Error(`Modbus exception FC03 from unit ${unitId}`);
     if (funcCode !== 0x03) continue;
 
     const byteCount = f[27];
-    if (frameLen < 28 + byteCount + 4) continue;        // incomplete Modbus data
+    // Deye known bug: Modbus CRC is appended twice (extra 2 zero bytes).
+    // The declared payloadLen covers both cases; we just read byteCount bytes.
+    if (f.length < s + 28 + byteCount) continue;        // incomplete
 
     const registers: number[] = [];
     for (let i = 0; i < byteCount; i += 2) {
@@ -237,6 +239,7 @@ async function readRegisters(
   const actualAddress = toModbusAddress(docStartAddress, config.addressOffset);
   const modbusRtu = buildModbusRtuReadRequest(config.unitId, actualAddress, count);
   const frame = buildSolarmanV5Frame(config.loggerSn, 0x01, modbusRtu);
+  hexDump('TX', frame);
 
   return new Promise<number[]>((resolve, reject) => {
     const socket = new net.Socket();
@@ -266,6 +269,7 @@ async function readRegisters(
     });
 
     socket.on('data', (chunk: Buffer) => {
+      hexDump('RX', chunk);
       chunks.push(chunk);
       try {
         const registers = tryExtractRegisters(Buffer.concat(chunks));
@@ -281,6 +285,8 @@ async function readRegisters(
 
     socket.on('close', () => {
       if (!settled) {
+        const received = Buffer.concat(chunks);
+        if (received.length > 0) hexDump('RX-on-close (unparsed)', received);
         settle(() => reject(new Error('Connection closed before a complete response was received')));
       }
     });
@@ -308,40 +314,35 @@ async function main(): Promise<void> {
   console.log('');
   console.log('Expected document addresses:');
   console.log(`- TOU enable:     ${formatDocAddress(TOU_ENABLE_REGISTER, config.addressOffset)}`);
-  console.log(`- TOU times:      ${formatDocAddress(TOU_TIME_START_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_TIME_START_REGISTER + 5, config.addressOffset)}`);
-  console.log(`- TOU power:      ${formatDocAddress(TOU_POWER_START_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_POWER_START_REGISTER + 5, config.addressOffset)}`);
-  console.log(`- TOU voltage:    ${formatDocAddress(TOU_VOLTAGE_START_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_VOLTAGE_START_REGISTER + 5, config.addressOffset)}`);
-  console.log(`- TOU capacity:   ${formatDocAddress(TOU_CAPACITY_START_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_CAPACITY_START_REGISTER + 5, config.addressOffset)}`);
-  console.log(`- Charge enable:  ${formatDocAddress(TOU_CHARGE_ENABLE_START_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_CHARGE_ENABLE_START_REGISTER + 5, config.addressOffset)}`);
+  console.log(`- TOU start time: ${formatDocAddress(TOU_START_TIME_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_START_TIME_REGISTER + 5, config.addressOffset)} (end time = next slot start)`);
+  console.log(`- TOU power:      ${formatDocAddress(TOU_POWER_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_POWER_REGISTER + 5, config.addressOffset)}`);
+  console.log(`- TOU voltage:    ${formatDocAddress(TOU_VOLTAGE_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_VOLTAGE_REGISTER + 5, config.addressOffset)}`);
+  console.log(`- TOU capacity:   ${formatDocAddress(TOU_CAPACITY_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_CAPACITY_REGISTER + 5, config.addressOffset)}`);
+  console.log(`- Charge enable:  ${formatDocAddress(TOU_CHARGE_ENABLE_REGISTER, config.addressOffset)}..${formatDocAddress(TOU_CHARGE_ENABLE_REGISTER + 5, config.addressOffset)}`);
   console.log('');
 
   try {
-    // Read one continuous block: registers 248..279 = 32 registers
+    // Read registers 248..279 = 32 registers.
+    // [0]     = reg 248  global TOU enable
+    // [1]     = reg 249  reserved
+    // [2..31] = reg 250..279  slot data (start time, power, voltage, capacity, charge enable)
+    //           End time is derived: endTime[i] = startTime[i+1], last slot wraps to startTime[0]
     const registers = await readRegisters(config, TOU_ENABLE_REGISTER, 32);
 
     const globalTouEnable = registers[0];
-    const slots = buildSlots(registers.slice(1, 31 + 1));
+    const slots = buildSlots(registers.slice(2)); // reg248=globalEnable, reg249=gap, reg250+=slot data
 
-    console.log(`Global TOU flags (register ${TOU_ENABLE_REGISTER}): ${globalTouEnable}`);
-    console.log('');
     console.table(
       slots.map((slot) => ({
         slot: slot.index,
-        enabled: slot.enabled,
-        time: slot.time,
+        startTime: slot.startTime,
+        endTime: slot.endTime,
         powerW: slot.powerW,
-        voltageV: slot.voltageV,
         capacityPercent: slot.capacityPercent,
-        gridCharge: slot.gridChargeEnabled,
-        generatorCharge: slot.generatorChargeEnabled,
-        gmMode: slot.gmMode,
-        buMode: slot.buMode,
-        chMode: slot.chMode,
+        gridCharge: slot.gridCharge,
+        genCharge: slot.genCharge,
       })),
     );
-
-    console.log('\nRaw slot data:');
-    console.log(JSON.stringify(slots, null, 2));
   } catch (error) {
     console.error('Failed to read Deye Time of Use data.');
     console.error(error);
