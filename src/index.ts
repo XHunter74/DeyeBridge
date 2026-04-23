@@ -329,7 +329,6 @@ async function main(): Promise<void> {
     //           End time is derived: endTime[i] = startTime[i+1], last slot wraps to startTime[0]
     const registers = await readRegisters(config, TOU_ENABLE_REGISTER, 32);
 
-    const globalTouEnable = registers[0];
     const slots = buildSlots(registers.slice(2)); // reg248=globalEnable, reg249=gap, reg250+=slot data
 
     console.table(
