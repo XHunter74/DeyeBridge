@@ -1,0 +1,20 @@
+{
+  "name": "deye-tou-test",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Test Node.js + TypeScript app for reading Deye Time of Use registers over Modbus",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts"
+  },
+  "dependencies": {
+    "modbus-serial": "^8.0.23"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3",
+    "@types/node": "^24.6.0"
+  }
+}
