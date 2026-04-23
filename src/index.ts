@@ -83,6 +83,16 @@ function decodeTime(raw: number): string {
   return `${hours.toString().padStart(2, '0')}:${minutes.toString().padStart(2, '0')}`;
 }
 
+function encodeTime(hhmm: string): number {
+  const match = /^(\d{2}):(\d{2})$/.exec(hhmm);
+  if (!match) throw new Error(`Invalid time format "${hhmm}": expected HH:MM`);
+  const hours = parseInt(match[1], 10);
+  const minutes = parseInt(match[2], 10);
+  if (hours > 23 || minutes > 59)
+    throw new Error(`Invalid time value "${hhmm}": hours must be 0-23, minutes 0-59`);
+  return hours * 100 + minutes;
+}
+
 function decodeChargeEnable(raw: number) {
   return {
     gridCharge: (raw & 0b00001) !== 0,
@@ -116,6 +126,33 @@ function buildSlots(registers: number[]): TimeSlot[] {
   });
 }
 
+function validateSlots(slots: TimeSlot[]): void {
+  if (slots.length !== TOU_SLOT_COUNT)
+    throw new Error(`Expected exactly ${TOU_SLOT_COUNT} slots, got ${slots.length}`);
+
+  for (let i = 0; i < TOU_SLOT_COUNT; i++) {
+    const s = slots[i];
+    const label = `Slot ${i + 1}`;
+    encodeTime(s.startTime); // validates HH:MM format and 00:00–23:59 range
+    if (s.powerW < 0 || s.powerW > 8000)
+      throw new Error(`${label}: powerW ${s.powerW} out of range [0, 8000]`);
+    if (s.capacityPercent < 0 || s.capacityPercent > 100)
+      throw new Error(`${label}: capacityPercent ${s.capacityPercent} out of range [0, 100]`);
+  }
+
+  // Start times must be strictly ascending so slots don't overlap.
+  // Slot 6's interval ends at slot 1's startTime (wraps at midnight).
+  for (let i = 1; i < TOU_SLOT_COUNT; i++) {
+    const prev = encodeTime(slots[i - 1].startTime);
+    const curr = encodeTime(slots[i].startTime);
+    if (curr <= prev)
+      throw new Error(
+        `Slot ${i + 1} startTime "${slots[i].startTime}" must be later than ` +
+        `slot ${i} startTime "${slots[i - 1].startTime}"`,
+      );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // SolarmanV5 protocol
 // Port 8899 on Deye inverters is NOT plain Modbus TCP. It speaks SolarmanV5:
@@ -144,6 +181,21 @@ function solarmanChecksum(buf: Buffer): number {
   let sum = 0;
   for (let i = 1; i < buf.length - 2; i++) sum += buf[i] & 0xff;
   return sum & 0xff;
+}
+
+function buildModbusRtuWriteRequest(unitId: number, startAddr: number, values: number[]): Buffer {
+  // FC16 Write Multiple Registers
+  // Layout: unitId(1) + 0x10(1) + startAddr(2) + regCount(2) + byteCount(1) + data(N×2) + CRC(2)
+  const byteCount = values.length * 2;
+  const buf = Buffer.alloc(9 + byteCount);
+  buf.writeUInt8(unitId, 0);
+  buf.writeUInt8(0x10, 1);
+  buf.writeUInt16BE(startAddr, 2);
+  buf.writeUInt16BE(values.length, 4);
+  buf.writeUInt8(byteCount, 6);
+  for (let i = 0; i < values.length; i++) buf.writeUInt16BE(values[i], 7 + i * 2);
+  buf.writeUInt16LE(modbusRtuCrc(buf.subarray(0, 7 + byteCount)), 7 + byteCount);
+  return buf;
 }
 
 function buildModbusRtuReadRequest(unitId: number, startAddr: number, count: number): Buffer {
@@ -190,6 +242,26 @@ function buildSolarmanV5Frame(loggerSn: number, seq: number, modbusRtu: Buffer):
   return buf;
 }
 
+// Parse a SolarmanV5 response frame and confirm an FC16 write acknowledgement.
+function tryExtractWriteAck(data: Buffer): boolean | null {
+  for (let s = 0; s <= data.length - 3; s++) {
+    if (data[s] !== 0xa5) continue;
+    const payloadLen = data.readUInt16LE(s + 1);
+    const frameLen = 11 + payloadLen + 2;
+    if (data.length < s + frameLen) continue;
+    const f = data.subarray(s, s + frameLen);
+    if (f[frameLen - 1] !== 0x15) continue;
+    const ctrlCode = f.readUInt16LE(3);
+    if (ctrlCode !== 0x1510 && ctrlCode !== 0x4510) continue;
+    const unitId = f[25];
+    const funcCode = f[26];
+    if (funcCode === 0x90) throw new Error(`Modbus exception on FC16 write from unit ${unitId}`);
+    if (funcCode !== 0x10) continue;
+    return true;
+  }
+  return null;
+}
+
 // Scan accumulated TCP data for a complete, valid SolarmanV5 response frame
 // and extract the Modbus holding-register values from it.
 function tryExtractRegisters(data: Buffer): number[] | null {
@@ -229,6 +301,87 @@ function tryExtractRegisters(data: Buffer): number[] | null {
     return registers;
   }
   return null;
+}
+
+async function writeRegisters(
+  config: Config,
+  docStartAddress: number,
+  values: number[],
+): Promise<void> {
+  const actualAddress = toModbusAddress(docStartAddress, config.addressOffset);
+  const modbusRtu = buildModbusRtuWriteRequest(config.unitId, actualAddress, values);
+  const frame = buildSolarmanV5Frame(config.loggerSn, 0x01, modbusRtu);
+  hexDump('TX', frame);
+
+  return new Promise<void>((resolve, reject) => {
+    const socket = new net.Socket();
+    const chunks: Buffer[] = [];
+    let settled = false;
+
+    function settle(fn: () => void): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.destroy();
+      fn();
+    }
+
+    const timer = setTimeout(() => {
+      settle(() => {
+        const err = Object.assign(new Error('Timed out'), {
+          name: 'TransactionTimedOutError',
+          errno: 'ETIMEDOUT',
+        });
+        reject(err);
+      });
+    }, config.timeoutMs);
+
+    socket.connect(config.port, config.host, () => {
+      socket.write(frame);
+    });
+
+    socket.on('data', (chunk: Buffer) => {
+      hexDump('RX', chunk);
+      chunks.push(chunk);
+      try {
+        const ack = tryExtractWriteAck(Buffer.concat(chunks));
+        if (ack !== null) settle(() => resolve());
+      } catch (err) {
+        settle(() => reject(err));
+      }
+    });
+
+    socket.on('error', (err: Error) => {
+      settle(() => reject(err));
+    });
+
+    socket.on('close', () => {
+      if (!settled) {
+        const received = Buffer.concat(chunks);
+        if (received.length > 0) hexDump('RX-on-close (unparsed)', received);
+        settle(() => reject(new Error('Connection closed before a write acknowledgement was received')));
+      }
+    });
+  });
+}
+
+// Write all 6 TOU slots to the device.
+// Issues two FC16 writes:
+//   1. Registers 250–261: start times + power
+//   2. Registers 268–279: capacity + charge enable
+// Registers 262–267 (sell-mode voltage) are not part of TimeSlot and are left untouched.
+export async function writeTimeOfUse(config: Config, slots: TimeSlot[]): Promise<void> {
+  validateSlots(slots);
+
+  const startTimeValues    = slots.map(s => encodeTime(s.startTime));
+  const powerValues        = slots.map(s => s.powerW);
+  const capacityValues     = slots.map(s => s.capacityPercent);
+  const chargeEnableValues = slots.map(s => (s.gridCharge ? 0b001 : 0) | (s.genCharge ? 0b010 : 0));
+
+  // Write start times (250–255) + power (256–261) together
+  await writeRegisters(config, TOU_START_TIME_REGISTER, [...startTimeValues, ...powerValues]);
+  // Write capacity (268–273) + charge enable (274–279) together
+  await writeRegisters(config, TOU_CAPACITY_REGISTER, [...capacityValues, ...chargeEnableValues]);
 }
 
 async function readRegisters(
